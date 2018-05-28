@@ -10,6 +10,7 @@ xmlcrypto     = require 'xml-crypto'
 xmldom        = require 'xmldom'
 xmlenc        = require 'xml-encryption'
 zlib          = require 'zlib'
+SignedXml     = require('xml-crypto').SignedXml
 
 XMLNS =
   SAML: 'urn:oasis:names:tc:SAML:2.0:assertion'
@@ -49,6 +50,14 @@ create_authn_request = (issuer, assert_endpoint, destination, force_authn, conte
       RequestedAuthnContext: context_element
   .end()
   { id, xml }
+
+# Adds an embedded signature to a previously generated AuthnRequest
+sign_authn_request = (xml, private_key, options) ->
+  signer = new SignedXml null, options
+  signer.addReference "//*[local-name(.)='AuthnRequest']", ['http://www.w3.org/2000/09/xmldsig#enveloped-signature','http://www.w3.org/2001/10/xml-exc-c14n#']
+  signer.signingKey = private_key
+  signer.computeSignature xml
+  return signer.getSignedXml()
 
 # Creates metadata and returns it as a string of XML. The metadata has one POST assertion endpoint.
 create_metadata = (entity_id, assert_endpoint, signing_certificates, encryption_certificates) ->
@@ -168,52 +177,14 @@ extract_certificate_data = (certificate) ->
 
   return cert_data.replace(/[\r\n]/g, '')
 
-# This checks the signature of a saml document and returns either array containing the signed data if valid, or null
-# if the signature is invalid. Comparing the result against null is NOT sufficient for signature checks as it doesn't
-# verify the signature is signing the important content, nor is it preventing the parsing of unsigned content.
-check_saml_signature = (xml, certificate) ->
-  doc = (new xmldom.DOMParser()).parseFromString(xml)
-
-  signature = xmlcrypto.xpath(doc, ".//*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']")
-  return null unless signature.length is 1
-  sig = new xmlcrypto.SignedXml()
-  sig.keyInfoProvider = getKey: -> format_pem(certificate, 'CERTIFICATE')
-  sig.loadSignature signature[0].toString()
-  valid = sig.checkSignature xml
-  if valid
-    return get_signed_data(doc, sig.references)
-  else
-    return null
-
-# Gets the data that is actually signed according to xml-crypto. This function should mirror the way xml-crypto finds
-# elements for security reasons.
-get_signed_data = (doc, references) ->
-  _.map references, (ref) ->
-    uri = ref.uri
-    if uri[0] is '#'
-      uri = uri.substring(1)
-
-    elem = []
-    if uri is ""
-      elem = xmlcrypto.xpath(doc, "//*")
-    else
-      for idAttribute in ["Id", "ID"]
-        elem = xmlcrypto.xpath(doc, "//*[@*[local-name(.)='" + idAttribute + "']='" + uri + "']")
-        if elem.length > 0
-          break
-
-    unless elem.length > 0
-      throw new Error("Invalid signature; must be a reference to '#{ref.uri}'")
-    elem[0].toString()
-
 # Takes in an xml @dom containing a SAML Status and returns true if at least one status is Success.
 check_status_success = (dom) ->
   status = dom.getElementsByTagNameNS(XMLNS.SAMLP, 'Status')
   return false unless status.length is 1
   for status_code in status[0].childNodes or []
     if status_code.attributes?
-      for attr in status_code.attributes or []
-        return true if attr?.name is 'Value' and attr?.value is 'urn:oasis:names:tc:SAML:2.0:status:Success'
+      status = get_attribute_value status_code, 'Value'
+      return status is 'urn:oasis:names:tc:SAML:2.0:status:Success'
   false
 
 get_status = (dom) ->
@@ -223,15 +194,12 @@ get_status = (dom) ->
 
   for status_code in status[0].childNodes or []
     if status_code.attributes?
-      for attr in status_code?.attributes or []
-        if attr?.name is 'Value'
-          top_status = attr.value
-          status_list[top_status] ?= []
+      top_status = get_attribute_value status_code, 'Value'
+      status_list[top_status] ?= []
     for sub_status_code in status_code.childNodes or []
       if sub_status_code?.attributes?
-        for attr in sub_status_code.attributes or []
-          if attr?.name is 'Value'
-            status_list[top_status].push attr?.value
+        status = get_attribute_value sub_status_code, 'Value'
+        status_list[top_status].push status
   status_list
 
 to_error = (err) ->
@@ -258,10 +226,10 @@ decrypt_assertion = (dom, private_keys, cb) ->
     unless encrypted_data.length is 1
       return cb new Error("Expected 1 EncryptedData inside EncryptedAssertion; found #{encrypted_data.length}.")
 
-    encrypted_data = encrypted_data[0].toString()
+    encrypted_assertion = encrypted_assertion[0].toString()
     errors = []
     async.eachOfSeries private_keys, (private_key, index, cb_e) ->
-      xmlenc.decrypt encrypted_data, {key: format_pem(private_key, 'PRIVATE KEY')}, (err, result) ->
+      xmlenc.decrypt encrypted_assertion, {key: format_pem(private_key, 'PRIVATE KEY')}, (err, result) ->
         if err?
           errors.push new Error("Decrypt failed: #{util.inspect err}") if err?
           return cb_e()
@@ -272,6 +240,44 @@ decrypt_assertion = (dom, private_keys, cb) ->
   catch err
     cb new Error("Decrypt failed: #{util.inspect err}")
 
+# This checks the signature of a saml document and returns either array containing the signed data if valid, or null
+# if the signature is invalid. Comparing the result against null is NOT sufficient for signature checks as it doesn't
+# verify the signature is signing the important content, nor is it preventing the parsing of unsigned content.
+check_saml_signature = (xml, certificate) ->
+  doc = (new xmldom.DOMParser()).parseFromString(xml)
+
+  signature = xmlcrypto.xpath(doc, "./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']")
+  return null unless signature.length is 1
+  sig = new xmlcrypto.SignedXml()
+  sig.keyInfoProvider = getKey: -> format_pem(certificate, 'CERTIFICATE')
+  sig.loadSignature signature[0].toString()
+  valid = sig.checkSignature xml
+  if valid
+    return get_signed_data(doc, sig)
+  else
+    return null
+
+# Gets the data that is actually signed according to xml-crypto. This function should mirror the way xml-crypto finds
+# elements for security reasons.
+get_signed_data = (doc, sig) ->
+  _.map sig.references, (ref) ->
+    uri = ref.uri
+    if uri[0] is '#'
+      uri = uri.substring(1)
+
+    elem = []
+    if uri is ""
+      elem = xmlcrypto.xpath(doc, "//*")
+    else
+      for idAttribute in ["Id", "ID"]
+        elem = xmlcrypto.xpath(doc, "//*[@*[local-name(.)='" + idAttribute + "']='" + uri + "']")
+        if elem.length > 0
+          break
+
+    unless elem.length > 0
+      throw new Error("Invalid signature; must be a reference to '#{ref.uri}'")
+    sig.getCanonXml ref.transforms, elem[0], { inclusiveNamespacesPrefixList: ref.inclusiveNamespacesPrefixList }
+
 # Takes in an xml @dom of an object containing a SAML Response and returns an object containing the Destination and
 # InResponseTo attributes of the Response if present. It will throw an error if the Response is missing or does not
 # appear to be valid.
@@ -281,17 +287,16 @@ parse_response_header = (dom) ->
     break if response.length > 0
   throw new Error("Expected 1 Response; found #{response.length}") unless response.length is 1
 
-  response_header = {}
-  for attr in response[0].attributes or []
-    switch attr?.name
-      when "Version"
-        throw new Error "Invalid SAML Version #{attr.value}" unless attr.value is "2.0"
-      when "Destination"
-        response_header.destination = attr.value
-      when "InResponseTo"
-        response_header.in_response_to = attr.value
-      when "ID"
-        response_header.id = attr.value
+  response_header = {
+    version: get_attribute_value response[0], 'Version'
+    destination: get_attribute_value response[0], 'Destination'
+    in_response_to: get_attribute_value response[0], 'InResponseTo'
+    id: get_attribute_value response[0], 'ID'
+  }
+
+  # If no version attribute is supplied, assume v2
+  version = response_header.version or '2.0'
+  throw new Error "Invalid SAML Version #{version}" unless version is "2.0"
   response_header
 
 # Takes in an xml @dom of an object containing a SAML Assertion and returns the NameID. If there is no NameID found,
@@ -308,24 +313,30 @@ get_name_id = (dom) ->
 
   nameid[0].firstChild?.data
 
+get_attribute_value = (node, attributeName) ->
+  attributes = node.attributes or []
+  attribute = _.filter attributes, (attr) -> attr.name is attributeName
+  attribute[0]?.value
+
 # Takes in an xml @dom of an object containing a SAML Assertion and returns the SessionIndex. It will throw an error
 # if there is no SessionIndex, no Assertion, or the Assertion does not appear to be valid. Optionally you can pass a
 # second argument `false` making SessionIndex optional. Doing so returns `null` instead of throwing an Error if the
 # SessionIndex attribute does not exist.
-get_session_index = (dom, index_required=true) ->
+get_session_info = (dom, index_required=true) ->
   assertion = dom.getElementsByTagNameNS(XMLNS.SAML, 'Assertion')
   throw new Error("Expected 1 Assertion; found #{assertion.length}") unless assertion.length is 1
 
   authn_statement = assertion[0].getElementsByTagNameNS(XMLNS.SAML, 'AuthnStatement')
   throw new Error("Expected 1 AuthnStatement; found #{authn_statement.length}") unless authn_statement.length is 1
 
-  for attr in authn_statement[0].attributes or []
-    if attr?.name is 'SessionIndex'
-      return attr.value
+  info =
+    index: get_attribute_value authn_statement[0], 'SessionIndex'
+    not_on_or_after: get_attribute_value authn_statement[0], 'SessionNotOnOrAfter'
 
-  if index_required
+  if index_required and not info.index?
     throw new Error("SessionIndex not an attribute of AuthnStatement.")
-  else return null
+
+  info
 
 # Takes in an xml @dom of an object containing a SAML Assertion and returns and object containing the attributes
 # contained within the Assertion. It will throw an error if the Assertion is missing or does not appear to be valid.
@@ -339,9 +350,7 @@ parse_assertion_attributes = (dom) ->
 
   assertion_attributes = {}
   for attribute in attribute_statement[0].getElementsByTagNameNS(XMLNS.SAML, 'Attribute')
-    for attr in attribute?.attributes or []
-      if attr?.name is 'Name'
-        attribute_name = attr?.value
+    attribute_name = get_attribute_value attribute, 'Name'
     throw new Error("Invalid attribute without name") unless attribute_name?
     attribute_values = attribute.getElementsByTagNameNS(XMLNS.SAML, 'AttributeValue')
     assertion_attributes[attribute_name] = _(attribute_values).map (attribute_value) ->
@@ -394,17 +403,18 @@ add_namespaces_to_child_assertions = (xml_string) ->
     assertion_elements = response_element.getElementsByTagNameNS XMLNS.SAML, 'Assertion'
     return xml_string if assertion_elements.length isnt 1
     assertion_element = assertion_elements[0]
-    return xml_string if assertion_element.getElementsByTagNameNS(XMLNS.DS, 'Signature').length is 0
 
     inclusive_namespaces = assertion_element.getElementsByTagNameNS(XMLNS.EXC_C14N, 'InclusiveNamespaces')[0]
-    return xml_string if not inclusive_namespaces
-    prefix_list = inclusive_namespaces.getAttribute('PrefixList')
+    namespaces = if inclusive_namespaces and prefixList = inclusive_namespaces.getAttribute('PrefixList')?.trim()
+      ("xmlns:#{ns}" for ns in prefixList.split(' '))
+    else
+      (attr.name for attr in response_element.attributes when attr.name.match /^xmlns:/)
 
     # add the namespaces that are present in response and missing in assertion.
-    for ns in prefix_list.split ' '
-      if response_element.getAttribute('xmlns:' + ns) and !assertion_element.getAttribute('xmlns:' + ns)
-        new_attribute = doc.createAttribute 'xmlns:' + ns
-        new_attribute.value = response_element.getAttribute 'xmlns:' + ns
+    for ns in namespaces
+      if response_element.getAttribute(ns) and !assertion_element.getAttribute(ns)
+        new_attribute = doc.createAttribute ns
+        new_attribute.value = response_element.getAttribute ns
         assertion_element.setAttributeNode new_attribute
 
     return new xmldom.XMLSerializer().serializeToString response_element
@@ -430,8 +440,11 @@ parse_authn_response = (saml_response, sp_private_keys, idp_certificates, allow_
         return cb_wf null, (new xmldom.DOMParser()).parseFromString(result)
 
       saml_response_str = saml_response.toString()
-      for cert in idp_certificates or []
-        signed_data = check_saml_signature(result, cert) or check_saml_signature saml_response_str, cert
+      for cert, i in idp_certificates or []
+        try
+          signed_data = check_saml_signature(result, cert) or check_saml_signature saml_response_str, cert
+        catch ex
+          return cb_wf new Error("SAML Assertion signature check failed! (Certificate \##{i+1} may be invalid. #{ex.message}")
         unless signed_data
           continue # Cert was not valid, try the next one
 
@@ -444,8 +457,12 @@ parse_authn_response = (saml_response, sp_private_keys, idp_certificates, allow_
       return cb_wf new Error("SAML Assertion signature check failed! (checked #{idp_certificates.length} certificate(s))")
     (decrypted_assertion, cb_wf) ->
       try
+        session_info = get_session_info decrypted_assertion, require_session_index
         user.name_id = get_name_id decrypted_assertion
-        user.session_index = get_session_index decrypted_assertion, require_session_index
+        user.session_index = session_info.index
+        if session_info.not_on_or_after?
+          user.session_not_on_or_after = session_info.not_on_or_after
+
         assertion_attributes = parse_assertion_attributes decrypted_assertion
         user = _.extend user, pretty_assertion_attributes(assertion_attributes)
         user = _.extend user, attributes: assertion_attributes
@@ -483,11 +500,14 @@ module.exports.ServiceProvider =
     constructor: (options) ->
       {@entity_id, @private_key, @certificate, @assert_endpoint, @alt_private_keys, @alt_certs} = options
 
+      options.audience ?= @entity_id
+      options.notbefore_skew ?= 1
+
       @alt_private_keys = [].concat(@alt_private_keys or [])
       @alt_certs = [].concat(@alt_certs or [])
 
       @shared_options = _(options).pick(
-        "force_authn", "auth_context", "nameid_format", "sign_get_request", "allow_unencrypted_assertion")
+        "force_authn", "auth_context", "nameid_format", "sign_get_request", "allow_unencrypted_assertion", "audience", "notbefore_skew")
 
     # Returns:
     #   Redirect URL at which a user can login
@@ -502,14 +522,28 @@ module.exports.ServiceProvider =
       { id, xml } = create_authn_request @entity_id, @assert_endpoint, identity_provider.sso_login_url, options.force_authn, options.auth_context, options.nameid_format
       zlib.deflateRaw xml, (err, deflated) =>
         return cb err if err?
-        uri = url.parse identity_provider.sso_login_url
-        delete uri.search
+        try
+          uri = url.parse identity_provider.sso_login_url, true
+        catch ex
+          return cb ex
+        delete uri.search # If you provide search and query search overrides query :/
         if options.sign_get_request
-          uri.query = sign_request deflated.toString('base64'), @private_key, options.relay_state
+          _(uri.query).extend sign_request(deflated.toString('base64'), @private_key, options.relay_state)
         else
-          uri.query = SAMLRequest: deflated.toString 'base64'
+          uri.query.SAMLRequest = deflated.toString 'base64'
           uri.query.RelayState = options.relay_state if options.relay_state?
         cb null, url.format(uri), id
+
+    # Returns:
+    #   An xml string with an AuthnRequest with an embedded xml signature
+    # Params:
+    #   identity_provider
+    #   options
+    create_authn_request_xml: (identity_provider, options) ->
+      options = set_option_defaults options, identity_provider.shared_options, @shared_options
+
+      { id, xml } = create_authn_request @entity_id, @assert_endpoint, identity_provider.sso_login_url, options.force_authn, options.auth_context, options.nameid_format
+      return sign_authn_request(xml, @private_key, options)
 
     # Returns:
     #   An object containing the parsed response for a redirect assert.
@@ -540,8 +574,10 @@ module.exports.ServiceProvider =
       unless options.request_body?.SAMLResponse? or options.request_body?.SAMLRequest?
         return setImmediate cb, new Error("Request body does not contain SAMLResponse or SAMLRequest.")
 
+      unless _.isNumber(options.notbefore_skew)
+        return setImmediate cb, new Error("Configuration error: `notbefore_skew` must be a number")
+
       saml_response = null
-      decrypted_assertion = null
       response = {}
 
       async.waterfall [
@@ -565,9 +601,32 @@ module.exports.ServiceProvider =
           switch
             when saml_response.getElementsByTagNameNS(XMLNS.SAMLP, 'Response').length is 1
               unless check_status_success(saml_response)
-                cb_wf new SAMLError("SAML Response was not success!", {status: get_status(saml_response)})
+                return cb_wf new SAMLError("SAML Response was not success!", {status: get_status(saml_response)})
 
               response.type = 'authn_response'
+
+              conditions = saml_response.getElementsByTagNameNS(XMLNS.SAML, 'Conditions')[0]
+              if conditions?
+                if options.ignore_timing != true
+                  for attribute in conditions.attributes
+                    condition = attribute.name.toLowerCase()
+                    if condition == 'notbefore' and Date.parse(attribute.value) > Date.now() + (options.notbefore_skew * 1000)
+                      return cb_wf new SAMLError('SAML Response is not yet valid', {NotBefore: attribute.value})
+                    if condition == 'notonorafter' and Date.parse(attribute.value) <= Date.now()
+                      return cb_wf new SAMLError('SAML Response is no longer valid', {NotOnOrAfter: attribute.value})
+
+                audience_restriction = conditions.getElementsByTagNameNS(XMLNS.SAML, 'AudienceRestriction')[0]
+                audiences = audience_restriction?.getElementsByTagNameNS(XMLNS.SAML, 'Audience')
+                if audiences?.length > 0
+                  validAudience = _.find audiences, (audience) ->
+                    audienceValue = audience.firstChild?.data?.trim()
+                    !_.isEmpty(audienceValue?.trim()) and (
+                      (_.isRegExp(options.audience) and options.audience.test(audienceValue)) or
+                      (_.isString(options.audience) and options.audience.toLowerCase() == audienceValue.toLowerCase())
+                    )
+                  if !validAudience?
+                    return cb_wf new SAMLError('SAML Response is not valid for this audience')
+
               parse_authn_response(
                 saml_response,
                 [@private_key].concat(@alt_private_keys),
@@ -579,7 +638,7 @@ module.exports.ServiceProvider =
 
             when saml_response.getElementsByTagNameNS(XMLNS.SAMLP, 'LogoutResponse').length is 1
               unless check_status_success(saml_response)
-                cb_wf new SAMLError("SAML Response was not success!", {status: get_status(saml_response)})
+                return cb_wf new SAMLError("SAML Response was not success!", {status: get_status(saml_response)})
 
               response.type = 'logout_response'
               setImmediate cb_wf, null, {}
@@ -607,7 +666,10 @@ module.exports.ServiceProvider =
       {id, xml} = create_logout_request @entity_id, options.name_id, options.session_index, identity_provider.sso_logout_url
       zlib.deflateRaw xml, (err, deflated) =>
         return cb err if err?
-        uri = url.parse identity_provider.sso_logout_url, true
+        try
+          uri = url.parse identity_provider.sso_logout_url, true
+        catch ex
+          return cb ex
         query = null
         if options.sign_get_request
           query = sign_request deflated.toString('base64'), @private_key, options.relay_state
@@ -632,7 +694,10 @@ module.exports.ServiceProvider =
       xml = create_logout_response @entity_id, options.in_response_to, identity_provider.sso_logout_url
       zlib.deflateRaw xml, (err, deflated) =>
         return cb err if err?
-        uri = url.parse identity_provider.sso_logout_url
+        try
+          uri = url.parse identity_provider.sso_logout_url
+        catch ex
+          return cb ex
         if options.sign_get_request
           uri.query = sign_request deflated.toString('base64'), @private_key, options.relay_state, true
         else
@@ -655,6 +720,7 @@ module.exports.IdentityProvider =
 
 if process.env.NODE_ENV is "test"
   module.exports.create_authn_request = create_authn_request
+  module.exports.sign_authn_request = sign_authn_request
   module.exports.create_metadata = create_metadata
   module.exports.format_pem = format_pem
   module.exports.sign_request = sign_request
@@ -665,7 +731,8 @@ if process.env.NODE_ENV is "test"
   module.exports.parse_response_header = parse_response_header
   module.exports.parse_logout_request = parse_logout_request
   module.exports.get_name_id = get_name_id
-  module.exports.get_session_index = get_session_index
+  module.exports.get_session_info = get_session_info
   module.exports.parse_assertion_attributes = parse_assertion_attributes
+  module.exports.add_namespaces_to_child_assertions = add_namespaces_to_child_assertions
   module.exports.set_option_defaults = set_option_defaults
   module.exports.extract_certificate_data = extract_certificate_data
